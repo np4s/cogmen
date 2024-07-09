@@ -10,6 +10,195 @@ from model import COGMEN
 from dataloader import get_IEMOCAP_loaders
 from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
 
+ACTS = {}
+
+def hook(module, args, output):
+    ACTS.update({module: args[0].detach()})
+
+def get_act():
+    act = ACTS.copy()
+    ACTS.clear()
+    return act
+
+MODAL_SPEC = {'text':[], 'audio':[], 'visual':[]}
+MODAL_GEN = []
+ISCORE = {}
+PEN = {}
+
+def modulation_init(model, dataloader, cuda_flag, args):
+    model.eval()
+    with torch.no_grad():
+        handles = []
+        for name, module in model.named_modules():
+            if not list(module.children()) and 'smax_fc' not in name:
+                if list(module.parameters()) and not isinstance(module, torch.nn.Embedding):
+                    handles.append(module.register_forward_hook(hook))
+
+        data = next(iter(dataloader))
+        textf, visuf, acouf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda_flag else data[:-1]
+        
+        model(textf, qmask, umask, acouf, visuf)
+        all_act = get_act()
+
+        if "v" in args.modals:
+            model(torch.zeros_like(textf), qmask, umask, torch.zeros_like(acouf), visuf)
+            v_act = get_act()
+
+        if "a" in args.modals:
+            model(torch.zeros_like(textf), qmask, umask, acouf, torch.zeros_like(visuf))
+            a_act = get_act()
+
+        if "l" in args.modals:
+            model(textf, qmask, umask, torch.zeros_like(acouf), torch.zeros_like(visuf))
+            l_act = get_act()
+
+        for key in all_act.keys():
+            if "l" in args.modals:
+                if torch.sum(all_act[key]-l_act[key]) == 0:
+                    MODAL_SPEC['text'].append(key)
+            if "a" in args.modals:
+                if torch.sum(all_act[key]-a_act[key]) == 0:
+                    MODAL_SPEC['audio'].append(key)
+            if "v" in args.modals:
+                if torch.sum(all_act[key]-v_act[key]) == 0:
+                    MODAL_SPEC['visual'].append(key)
+        
+        spec = MODAL_SPEC['text'] + MODAL_SPEC['audio'] + MODAL_SPEC['visual']
+        for module in all_act.keys():
+            if module not in spec:
+                MODAL_GEN.append(module)
+        
+        for handle in handles:
+            handle.remove()
+
+def get_penalty(tensor, rate):
+    pos_num = torch.sum((tensor>0).int()).item()
+    sorted = torch.sort(tensor, descending=True)[0]
+    threshold = sorted[max(int(pos_num*rate)-1, 0)]
+    penalty = (tensor > threshold).float()
+    return penalty
+
+def modulation(model, all_prob, textf, qmask, lengths, acouf, visuf, label, step, args):
+    model.eval()
+    if step % args.tau == 0:
+        with torch.no_grad():
+            all_act = get_act()
+            loss_all = loss_f(all_prob, label)
+
+            if "l" in args.modals:
+                el_prob = model(torch.zeros_like(textf), qmask, lengths, acouf, visuf)
+                el_act = get_act()
+                loss_el = loss_f(el_prob, label)
+
+            if "v" in args.modals:
+                ev_prob = model(textf, qmask, lengths, acouf, torch.zeros_like(visuf))
+                ev_act = get_act()
+                loss_ev = loss_f(ev_prob, label)
+
+            if "a" in args.modals:
+                ea_prob = model(textf, qmask, lengths, torch.zeros_like(acouf), visuf)
+                ea_act = get_act()
+                loss_ea = loss_f(ea_prob, label)
+
+            if args.modals == "avl":
+                score = torch.tensor([loss_ea-loss_all, loss_ev-loss_all, loss_el-loss_all])
+            elif args.modals == "av":
+                score = torch.tensor([loss_ea-loss_all, loss_ev-loss_all])
+            elif args.modals == "al":
+                score = torch.tensor([loss_ea-loss_all, loss_el-loss_all])
+            elif args.modals == "vl":
+                score = torch.tensor([loss_ev-loss_all, loss_el-loss_all])
+            
+            ratio = F.softmax(0.1*score, dim=0)
+            r_min, _ = torch.min(ratio, dim=0)
+            iscore = (ratio - r_min)**args.gamma
+
+            if args.modals == "avl":
+                iscore_a, iscore_v, iscore_l = iscore[0], iscore[1], iscore[2]
+            elif args.modals == "av":
+                iscore_a, iscore_v = iscore[0], iscore[1]
+            elif args.modals == "al":
+                iscore_a, iscore_l = iscore[0], iscore[1]
+            elif args.modals == "vl":
+                iscore_v, iscore_l = iscore[0], iscore[1]
+            
+
+            if "a" in args.modals:
+                ISCORE.update({"audio": iscore_a})
+            if "v" in args.modals:
+                ISCORE.update({"video": iscore_v})
+            if "l" in args.modals:
+                ISCORE.update({"text": iscore_l})
+
+    if "a" in args.modals:
+        for module in MODAL_SPEC['audio']:
+            for param in module.parameters():
+                if param.grad is not None:
+                    param.grad *= (1 - ISCORE["audio"])
+
+    if "v" in args.modals:
+        for module in MODAL_SPEC['visual']:
+            for param in module.parameters():
+                if param.grad is not None:
+                    param.grad *= (1 - ISCORE["video"])
+    
+    if "l" in args.modals:
+        for module in MODAL_SPEC['text']:
+            for param in module.parameters():
+                if param.grad is not None:
+                    param.grad *= (1 - ISCORE["text"])
+    
+    for module in MODAL_GEN:
+        if step % args.tau == 0:
+            if "l" in args.modals:
+                delta_l = torch.abs(all_act[module] - el_act[module])
+                delta_l = torch.mean(delta_l.reshape(-1, delta_l.size(-1)), dim=0)
+            else:
+                delta_l = torch.zeros(all_act[module].size(-1)).cuda()
+
+            if "a" in args.modals:
+                delta_a = torch.abs(all_act[module] - ea_act[module])
+                delta_a = torch.mean(delta_a.reshape(-1, delta_a.size(-1)), dim=0)
+            else:
+                delta_a = torch.zeros(all_act[module].size(-1)).cuda()
+            
+            if "v" in args.modals:
+                delta_v = torch.abs(all_act[module] - ev_act[module])
+                delta_v = torch.mean(delta_v.reshape(-1, delta_v.size(-1)), dim=0)
+            else:
+                delta_v = torch.zeros(all_act[module].size(-1)).cuda()
+
+            # rate = (epoch/args.epochs)**args.beta
+            rate = args.beta
+            pen = torch.zeros(all_act[module].size(-1)).cuda()
+
+            if "a" in args.modals:
+                delta = delta_a - torch.max(torch.stack([delta_l, delta_v], dim=0), dim=0)[0]
+                pen_a = get_penalty(delta, rate)
+                pen += pen_a * ISCORE["audio"]
+            
+            if "v" in args.modals:
+                delta = delta_v - torch.max(torch.stack([delta_a, delta_l], dim=0), dim=0)[0]
+                pen_v = get_penalty(delta, rate)
+                pen += pen_v * ISCORE["video"]
+
+            if "l" in args.modals:
+                delta = delta_l - torch.max(torch.stack([delta_a, delta_v], dim=0), dim=0)[0]
+                pen_l = get_penalty(delta, rate)
+                pen += pen_l * ISCORE["text"]
+
+            pen = 1-pen
+            PEN.update({module: pen})
+
+        for param in module.parameters():
+            if param.grad is not None:
+                if len(param.grad.size()) > 1: # weight
+                    if module.__class__.__name__ == 'LSTM' and param.grad.size()[1] != PEN[module].size():
+                        continue
+                    param.grad *= PEN[module].unsqueeze(0)
+
+    model.train()
+
 def train_or_eval_model(model, loss_f, dataloader, epoch=0, train_flag=False, optimizer=None, cuda_flag=False, args=None,
                               test_label=False):
     losses, preds, labels, masks = [], [], [], []
@@ -28,10 +217,10 @@ def train_or_eval_model(model, loss_f, dataloader, epoch=0, train_flag=False, op
         textf, visuf, acouf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda_flag else data[:-1]
         lengths = [(umask[j] == 1).nonzero().tolist()[-1][0] + 1 for j in range(len(umask))]
         
-        # handles = []
-        # if train_flag == True and args.modulation == True and step % args.tau == 0:
-        #     for module in MODAL_GEN:
-        #         handles.append(module.register_forward_hook(hook))
+        handles = []
+        if train_flag == True and args.modulation == True and step % args.tau == 0:
+            for module in MODAL_GEN:
+                handles.append(module.register_forward_hook(hook))
         
         log_prob = model(textf, lengths, qmask, acouf=acouf, visuf= visuf)
         label = torch.cat([label[j][:lengths[j]] for j in range(len(label))])
@@ -43,11 +232,11 @@ def train_or_eval_model(model, loss_f, dataloader, epoch=0, train_flag=False, op
         if train_flag == True:
             loss.backward()
 
-            # if args.modulation == True:
+            if args.modulation == True:
 
-            #     modulation(model, log_prob, textf, qmask, umask, acouf, visuf, labels_, step, args)
-            #     for handle in handles:
-            #         handle.remove()
+                modulation(model, log_prob, textf, qmask, umask, acouf, visuf, labels, step, args)
+                for handle in handles:
+                    handle.remove()
 
             optimizer.step()
             step += 1

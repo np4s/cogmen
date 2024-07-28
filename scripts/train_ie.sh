@@ -1,6 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
-
-EXP_NO="test2"
+EXP_NO="testing"
 MODALS="avl"
 
 echo "IEMOCAP, ${MODALS}, ${EXP_NO}"
@@ -16,7 +14,6 @@ python -u ./code/train.py \
 --dataset "IEMOCAP" \
 --data_dir "./data/iemocap/IEMOCAP_features.pkl" \
 --log_dir ${LOG_PATH}/${EXP_NO} \
---no_cuda \
 --windowp 4 \
 --windowf 4 \
 --gnn_nhead 7 \

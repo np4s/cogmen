@@ -9,6 +9,14 @@ import torch.nn.functional as F
 from model import COGMEN
 from dataloader import get_IEMOCAP_loaders
 from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
+from comet_ml import Experiment
+from comet_ml.integration.pytorch import log_model
+
+experiment = Experiment(
+  api_key="",
+  project_name="cogmen",
+  workspace="np4s"
+)
 
 def train_or_eval_model(model, loss_f, dataloader, epoch=0, train_flag=False, optimizer=None, cuda_flag=False, args=None,
                               test_label=False):
@@ -98,7 +106,9 @@ if __name__ == '__main__':
     parser.add_argument('--modulation', action='store_true', default=False, help='Enables grad modulation')
     args = parser.parse_args()
 
+    # log all the args
     print(args)
+    experiment.log_parameters(vars(args))
     
     cuda_flag = torch.cuda.is_available() and not args.no_cuda
     
@@ -231,3 +241,4 @@ if __name__ == '__main__':
     print('Loss {}, accuracy {}'.format(test_loss, test_acc))
     print(classification_report(test_label, test_pred, digits=4))
     print(confusion_matrix(test_label, test_pred))
+    log_model(experiment, model, model_name=args.name, overwrite=True)

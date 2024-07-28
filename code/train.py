@@ -22,7 +22,6 @@ def train_or_eval_model(model, loss_f, dataloader, epoch=0, train_flag=False, op
                               test_label=False):
     losses, preds, labels, masks = [], [], [], []
 
-    assert not train_flag or optimizer != None
     if train_flag:
         model.train()
     else:
